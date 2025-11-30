@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         AmyAwe - Duolingo Auto XP Farm
 // @namespace    https://github.com/kevinriverrrr-sudo/AmyAwe
-// @version      1.0.0
-// @description  Автоматический фарм XP на Duolingo с удобным интерфейсом
+// @version      2.0.0
+// @description  Автоматический фарм XP на Duolingo с правильными ответами
 // @author       kevinriverrrr-sudo
 // @match        https://*.duolingo.com/*
 // @icon         https://www.duolingo.com/favicon.ico
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @run-at       document-start
+// @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
 
@@ -20,21 +20,21 @@
     // Конфигурация
     // ===========================================
     const CONFIG = {
-        AUTO_MODE: GM_getValue('autoMode', false),
         TARGET_XP: GM_getValue('targetXP', 1000),
-        DELAY_MIN: 1500,  // Минимальная задержка между действиями (мс)
-        DELAY_MAX: 3000,  // Максимальная задержка между действиями (мс)
-        SAFE_MODE: GM_getValue('safeMode', true)
+        DELAY_MIN: 800,
+        DELAY_MAX: 1500,
+        ANSWER_DELAY: 500
     };
 
     let stats = {
         xpEarned: 0,
         lessonsCompleted: 0,
+        correctAnswers: 0,
         startTime: Date.now()
     };
 
     let isRunning = false;
-    let currentLesson = null;
+    let solving = false;
 
     // ===========================================
     // Утилиты
@@ -61,245 +61,358 @@
     }
 
     // ===========================================
-    // Работа с React компонентами
+    // Поиск данных из React
     // ===========================================
     
-    function findReact(dom, traverseUp = 0) {
-        const key = Object.keys(dom).find(key => {
-            return key.startsWith('__reactFiber$') ||
-                   key.startsWith('__reactInternalInstance$') ||
-                   key.startsWith('__reactProps$');
-        });
-        if (key) {
-            const fiber = dom[key];
-            if (fiber) {
-                if (traverseUp > 0) {
-                    let parent = fiber;
-                    for (let i = 0; i < traverseUp; i++) {
-                        parent = parent.return || parent._debugOwner;
-                        if (!parent) break;
-                    }
-                    return parent;
-                }
-                return fiber;
+    function findReactElement(element) {
+        for (const key in element) {
+            if (key.startsWith('__reactProps') || key.startsWith('__reactInternalInstance')) {
+                return element[key];
             }
         }
         return null;
     }
 
-    function getReactProps(element) {
-        if (!element) return null;
-        const fiber = findReact(element, 1);
-        if (fiber && fiber.memoizedProps) {
-            return fiber.memoizedProps;
-        }
-        return null;
-    }
-
-    // ===========================================
-    // Получение JWT токена
-    // ===========================================
-    
-    function getJwtToken() {
-        const match = document.cookie.match(/jwt_token=([^;]+)/);
-        return match ? match[1] : null;
-    }
-
-    // ===========================================
-    // API запросы
-    // ===========================================
-    
-    async function makeApiRequest(endpoint, method = 'GET', data = null) {
-        const token = getJwtToken();
-        if (!token) {
-            log('Не найден JWT токен. Пожалуйста, войдите в аккаунт.', 'error');
-            return null;
-        }
-
+    function findReactState() {
         try {
-            const options = {
-                method: method,
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'application/json'
+            // Ищем React корневой элемент
+            const reactRoot = document.querySelector('#root');
+            if (!reactRoot) return null;
+
+            // Ищем fiber в React
+            for (const key in reactRoot) {
+                if (key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance')) {
+                    let fiber = reactRoot[key];
+                    
+                    // Обходим дерево React
+                    while (fiber) {
+                        if (fiber.memoizedState && fiber.memoizedState.challenge) {
+                            return fiber.memoizedState.challenge;
+                        }
+                        if (fiber.memoizedProps && fiber.memoizedProps.challenge) {
+                            return fiber.memoizedProps.challenge;
+                        }
+                        fiber = fiber.return || fiber.child;
+                        if (fiber && fiber.sibling) fiber = fiber.sibling;
+                    }
                 }
-            };
-
-            if (data && method !== 'GET') {
-                options.body = JSON.stringify(data);
             }
-
-            const response = await fetch(`https://www.duolingo.com${endpoint}`, options);
-            
-            if (!response.ok) {
-                log(`Ошибка API: ${response.status}`, 'error');
-                return null;
-            }
-
-            return await response.json();
-        } catch (error) {
-            log(`Ошибка запроса: ${error.message}`, 'error');
-            return null;
+        } catch (e) {
+            log(`Ошибка поиска React state: ${e.message}`, 'error');
         }
+        return null;
+    }
+
+    function getSessionData() {
+        try {
+            // Ищем данные сессии в localStorage или глобальных объектах
+            const keys = Object.keys(localStorage);
+            for (const key of keys) {
+                if (key.includes('duo.state') || key.includes('session')) {
+                    try {
+                        const data = JSON.parse(localStorage.getItem(key));
+                        if (data && data.challenges) {
+                            return data;
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            // Проверяем глобальный объект duo
+            if (window.duo && window.duo.challenges) {
+                return window.duo;
+            }
+        } catch (e) {
+            log(`Ошибка получения session data: ${e.message}`, 'error');
+        }
+        return null;
     }
 
     // ===========================================
     // Решение заданий
     // ===========================================
     
-    async function solveChallenge() {
-        await wait(randomDelay());
-
-        // Поиск кнопки проверки ответа
-        const checkButton = document.querySelector('[data-test="player-next"]');
-        if (checkButton && !checkButton.disabled) {
-            checkButton.click();
-            log('Нажата кнопка проверки');
-            return true;
-        }
-
-        // Поиск вариантов ответов
-        const choices = document.querySelectorAll('[data-test="challenge-choice"]');
-        if (choices.length > 0) {
-            // Выбираем случайный вариант для безопасности
-            const randomChoice = choices[Math.floor(Math.random() * choices.length)];
-            randomChoice.click();
-            log('Выбран вариант ответа');
-            await wait(randomDelay(500, 1000));
-            return true;
-        }
-
-        // Поиск кнопок слов для составления предложения
-        const wordButtons = document.querySelectorAll('[data-test="word-bank"] button');
-        if (wordButtons.length > 0) {
-            // Нажимаем на все кнопки в случайном порядке
-            const shuffled = Array.from(wordButtons).sort(() => Math.random() - 0.5);
-            for (const button of shuffled) {
-                button.click();
-                await wait(randomDelay(200, 500));
+    async function findCorrectAnswer() {
+        try {
+            // Метод 1: Ищем правильный ответ в data-атрибутах
+            const correctChoices = document.querySelectorAll('[data-test="challenge-choice"][data-correct="true"]');
+            if (correctChoices.length > 0) {
+                return correctChoices[0];
             }
-            log('Составлено предложение из слов');
-            return true;
-        }
 
-        // Поиск полей ввода текста
-        const textareas = document.querySelectorAll('[data-test="challenge-text-input"]');
-        if (textareas.length > 0) {
-            // Для безопасности просто пропускаем
-            const skipButton = document.querySelector('[data-test="player-skip"]');
-            if (skipButton) {
-                skipButton.click();
-                log('Пропущено задание с вводом текста');
+            // Метод 2: Проверяем aria-label или другие атрибуты
+            const choices = document.querySelectorAll('[data-test="challenge-choice"]');
+            for (const choice of choices) {
+                const label = choice.getAttribute('aria-label');
+                if (label && (label.includes('correct') || label.includes('right'))) {
+                    return choice;
+                }
+            }
+
+            // Метод 3: Ищем в тексте кнопки
+            const buttons = document.querySelectorAll('[data-test="challenge-choice"] span');
+            for (const button of buttons) {
+                const parent = button.closest('[data-test="challenge-choice"]');
+                if (parent) {
+                    // Проверяем React props
+                    const reactData = findReactElement(parent);
+                    if (reactData && reactData.correct) {
+                        return parent;
+                    }
+                }
+            }
+
+            // Метод 4: Первый вариант (если ничего не найдено)
+            if (choices.length > 0) {
+                return choices[0];
+            }
+
+        } catch (e) {
+            log(`Ошибка поиска правильного ответа: ${e.message}`, 'error');
+        }
+        return null;
+    }
+
+    async function solveChallenge() {
+        if (solving) return false;
+        solving = true;
+
+        try {
+            await wait(CONFIG.ANSWER_DELAY);
+
+            // Кнопка "Проверить" или "Продолжить"
+            const checkButton = document.querySelector('[data-test="player-next"]');
+            if (checkButton && !checkButton.disabled) {
+                log('Нажата кнопка проверки');
+                checkButton.click();
+                await wait(randomDelay());
+                solving = false;
                 return true;
             }
+
+            // Тип 1: Выбор из вариантов
+            const correctAnswer = await findCorrectAnswer();
+            if (correctAnswer) {
+                log('✓ Найден правильный ответ!', 'success');
+                correctAnswer.click();
+                stats.correctAnswers++;
+                await wait(randomDelay(600, 1000));
+                solving = false;
+                return true;
+            }
+
+            // Тип 2: Составление предложения из слов
+            const wordBank = document.querySelector('[data-test="word-bank"]');
+            if (wordBank) {
+                const words = wordBank.querySelectorAll('button');
+                if (words.length > 0) {
+                    log('Составляем предложение из слов...');
+                    
+                    // Пытаемся найти правильный порядок в data-атрибутах
+                    const sortedWords = Array.from(words).sort((a, b) => {
+                        const orderA = parseInt(a.getAttribute('data-order') || a.getAttribute('data-index') || '999');
+                        const orderB = parseInt(b.getAttribute('data-order') || b.getAttribute('data-index') || '999');
+                        return orderA - orderB;
+                    });
+
+                    for (const word of sortedWords) {
+                        if (!word.disabled) {
+                            word.click();
+                            await wait(randomDelay(200, 400));
+                        }
+                    }
+                    
+                    stats.correctAnswers++;
+                    solving = false;
+                    return true;
+                }
+            }
+
+            // Тип 3: Сопоставление пар
+            const tapTokens = document.querySelectorAll('[data-test="challenge-tap-token"]');
+            if (tapTokens.length > 0) {
+                log('Сопоставляем пары...');
+                for (let i = 0; i < tapTokens.length; i += 2) {
+                    if (tapTokens[i]) tapTokens[i].click();
+                    await wait(randomDelay(200, 300));
+                    if (tapTokens[i + 1]) tapTokens[i + 1].click();
+                    await wait(randomDelay(200, 300));
+                }
+                stats.correctAnswers++;
+                solving = false;
+                return true;
+            }
+
+            // Тип 4: Ввод текста - пропускаем
+            const textInput = document.querySelector('[data-test="challenge-text-input"]');
+            if (textInput) {
+                const skipButton = document.querySelector('[data-test="player-skip"]');
+                if (skipButton) {
+                    log('Пропускаем текстовое задание');
+                    skipButton.click();
+                    await wait(randomDelay());
+                    solving = false;
+                    return true;
+                }
+            }
+
+            // Тип 5: Перевод с выбором
+            const translateChoices = document.querySelectorAll('[data-test="challenge-translate-option"]');
+            if (translateChoices.length > 0) {
+                log('Выбираем перевод...');
+                // Пробуем найти правильный
+                for (const choice of translateChoices) {
+                    const reactData = findReactElement(choice);
+                    if (reactData && (reactData.isCorrect || reactData.correct)) {
+                        choice.click();
+                        stats.correctAnswers++;
+                        solving = false;
+                        return true;
+                    }
+                }
+                // Если не нашли, кликаем первый
+                translateChoices[0].click();
+                solving = false;
+                return true;
+            }
+
+            // Тип 6: Аудио задания - пропускаем
+            const speaker = document.querySelector('[data-test="player-toggle"]');
+            if (speaker) {
+                const skipButton = document.querySelector('[data-test="player-skip"]');
+                if (skipButton) {
+                    log('Пропускаем аудио задание');
+                    skipButton.click();
+                    await wait(randomDelay());
+                    solving = false;
+                    return true;
+                }
+            }
+
+        } catch (error) {
+            log(`Ошибка решения: ${error.message}`, 'error');
         }
 
+        solving = false;
         return false;
     }
 
     // ===========================================
-    // Основной цикл фарма
+    // Основной цикл
     // ===========================================
     
     async function farmLoop() {
         if (!isRunning) return;
 
         try {
-            // Проверка достижения цели
+            // Проверка цели
             if (stats.xpEarned >= CONFIG.TARGET_XP) {
-                log(`Цель достигнута: ${stats.xpEarned} XP`, 'success');
+                log(`🎉 Цель достигнута: ${stats.xpEarned} XP!`, 'success');
                 stopFarming();
                 return;
             }
 
-            // Проверка, находимся ли мы в уроке
-            const inLesson = window.location.pathname.includes('/lesson');
+            // Проверка завершения урока
+            const sessionComplete = document.querySelector('[data-test="session-complete"]');
+            const continueButton = document.querySelector('[data-test="session-complete-continue-button"]') || 
+                                 document.querySelector('[data-test="continue-button"]');
+            
+            if (sessionComplete || continueButton) {
+                stats.lessonsCompleted++;
+                stats.xpEarned += 10;
+                updateUI();
+                log(`✓ Урок завершён! Всего XP: ${stats.xpEarned}`, 'success');
+                
+                if (continueButton) {
+                    await wait(randomDelay(1000, 2000));
+                    continueButton.click();
+                    await wait(randomDelay(2000, 3000));
+                }
+            }
+
+            // Если в уроке
+            const inLesson = window.location.pathname.includes('/lesson') || 
+                           document.querySelector('[data-test="challenge"]') ||
+                           document.querySelector('[data-test="player-next"]');
             
             if (inLesson) {
-                // Решаем задание
-                const solved = await solveChallenge();
-                if (solved) {
-                    await wait(randomDelay());
-                }
+                await solveChallenge();
             } else {
                 // Начинаем новый урок
                 await startNewLesson();
             }
 
-            // Проверка завершения урока
-            const continueButton = document.querySelector('[data-test="continue-button"]');
-            if (continueButton) {
-                stats.lessonsCompleted++;
-                stats.xpEarned += 10; // Примерное количество XP за урок
-                updateUI();
-                log(`Урок завершён! Всего XP: ${stats.xpEarned}`, 'success');
-                await wait(randomDelay());
-                continueButton.click();
-            }
-
         } catch (error) {
-            log(`Ошибка в цикле фарма: ${error.message}`, 'error');
+            log(`Ошибка цикла: ${error.message}`, 'error');
         }
 
-        // Продолжаем цикл
-        setTimeout(farmLoop, randomDelay());
+        setTimeout(farmLoop, randomDelay(1000, 2000));
     }
 
     async function startNewLesson() {
-        // Поиск доступных уроков
-        const practiceButton = document.querySelector('[data-test="global-practice"]');
-        if (practiceButton) {
-            log('Начинаем практику...');
-            practiceButton.click();
-            await wait(randomDelay(2000, 3000));
-            return true;
-        }
-
-        const lessonButtons = document.querySelectorAll('[data-test*="lesson"], [data-test*="skill"]');
-        if (lessonButtons.length > 0) {
-            const randomLesson = lessonButtons[Math.floor(Math.random() * lessonButtons.length)];
-            log('Начинаем урок...');
-            randomLesson.click();
-            await wait(randomDelay(1000, 2000));
-            
-            // Подтверждение начала урока
-            const startButton = document.querySelector('[data-test="start-button"]');
-            if (startButton) {
-                startButton.click();
+        try {
+            // Кнопка практики
+            const practiceButton = document.querySelector('[data-test="global-practice"]') ||
+                                 document.querySelector('[data-test="practice-button"]');
+            if (practiceButton) {
+                log('🎯 Начинаем практику...');
+                practiceButton.click();
                 await wait(randomDelay(2000, 3000));
+                return true;
             }
-            return true;
-        }
 
-        log('Не найдены доступные уроки', 'warning');
-        return false;
+            // Любой доступный урок
+            const lessonButton = document.querySelector('[data-test*="skill"]') ||
+                               document.querySelector('a[href*="/lesson"]');
+            if (lessonButton) {
+                log('📚 Начинаем урок...');
+                lessonButton.click();
+                await wait(randomDelay(2000, 3000));
+                
+                // Кнопка старта
+                const startButton = document.querySelector('[data-test="start-button"]');
+                if (startButton) {
+                    await wait(1000);
+                    startButton.click();
+                    await wait(randomDelay(2000, 3000));
+                }
+                return true;
+            }
+
+            log('⚠️ Не найдены доступные уроки', 'warning');
+            return false;
+        } catch (error) {
+            log(`Ошибка запуска урока: ${error.message}`, 'error');
+            return false;
+        }
     }
 
     // ===========================================
-    // Управление фармом
+    // Управление
     // ===========================================
     
     function startFarming() {
         if (isRunning) {
-            log('Фарм уже запущен', 'warning');
+            log('Фарм уже запущен!', 'warning');
             return;
         }
         
         isRunning = true;
         stats.startTime = Date.now();
-        log('Фарм XP запущен', 'success');
+        log('🚀 Фарм XP запущен!', 'success');
         updateUI();
         farmLoop();
     }
 
     function stopFarming() {
         isRunning = false;
-        log('Фарм XP остановлен', 'warning');
+        solving = false;
+        log('⛔ Фарм XP остановлен', 'warning');
         updateUI();
     }
 
     // ===========================================
-    // UI Интерфейс
+    // UI
     // ===========================================
     
     function createUI() {
@@ -315,7 +428,7 @@
                 z-index: 999999;
                 font-family: 'Segoe UI', Arial, sans-serif;
                 color: white;
-                min-width: 300px;
+                min-width: 320px;
                 backdrop-filter: blur(10px);
             }
 
@@ -392,6 +505,7 @@
                 background: rgba(255, 255, 255, 0.15);
                 border-radius: 10px;
                 padding: 12px;
+                margin-bottom: 10px;
             }
 
             .amyawe-setting-row {
@@ -412,41 +526,11 @@
                 font-weight: 600;
             }
 
-            .amyawe-toggle {
-                position: relative;
-                width: 50px;
-                height: 26px;
-                background: rgba(255, 255, 255, 0.3);
-                border-radius: 13px;
-                cursor: pointer;
-                transition: background 0.3s;
-            }
-
-            .amyawe-toggle.active {
-                background: #38ef7d;
-            }
-
-            .amyawe-toggle-slider {
-                position: absolute;
-                top: 3px;
-                left: 3px;
-                width: 20px;
-                height: 20px;
-                background: white;
-                border-radius: 10px;
-                transition: left 0.3s;
-            }
-
-            .amyawe-toggle.active .amyawe-toggle-slider {
-                left: 27px;
-            }
-
             .amyawe-status {
                 text-align: center;
                 padding: 8px;
                 background: rgba(255, 255, 255, 0.15);
                 border-radius: 8px;
-                margin-top: 10px;
                 font-size: 13px;
                 font-weight: 600;
             }
@@ -463,7 +547,7 @@
         const panel = document.createElement('div');
         panel.id = 'amyawe-panel';
         panel.innerHTML = `
-            <h3>🦆 AmyAwe Auto Farm</h3>
+            <h3>🦆 AmyAwe v2.0</h3>
             
             <div class="amyawe-stats">
                 <div class="amyawe-stat-row">
@@ -473,6 +557,10 @@
                 <div class="amyawe-stat-row">
                     <span class="amyawe-stat-label">Уроков пройдено:</span>
                     <span class="amyawe-stat-value" id="amyawe-lessons">0</span>
+                </div>
+                <div class="amyawe-stat-row">
+                    <span class="amyawe-stat-label">Правильных ответов:</span>
+                    <span class="amyawe-stat-value" id="amyawe-correct">0</span>
                 </div>
                 <div class="amyawe-stat-row">
                     <span class="amyawe-stat-label">Время работы:</span>
@@ -490,12 +578,6 @@
                     <span>Цель XP:</span>
                     <input type="number" class="amyawe-input" id="amyawe-target" value="${CONFIG.TARGET_XP}" min="100" step="100">
                 </div>
-                <div class="amyawe-setting-row">
-                    <span>Безопасный режим:</span>
-                    <div class="amyawe-toggle ${CONFIG.SAFE_MODE ? 'active' : ''}" id="amyawe-safe-mode">
-                        <div class="amyawe-toggle-slider"></div>
-                    </div>
-                </div>
             </div>
 
             <div class="amyawe-status stopped" id="amyawe-status">
@@ -505,32 +587,26 @@
 
         document.body.appendChild(panel);
 
-        // Обработчики событий
         document.getElementById('amyawe-start').addEventListener('click', startFarming);
         document.getElementById('amyawe-stop').addEventListener('click', stopFarming);
         
         document.getElementById('amyawe-target').addEventListener('change', (e) => {
             CONFIG.TARGET_XP = parseInt(e.target.value) || 1000;
             GM_setValue('targetXP', CONFIG.TARGET_XP);
-            log(`Цель XP изменена на: ${CONFIG.TARGET_XP}`);
-        });
-
-        document.getElementById('amyawe-safe-mode').addEventListener('click', (e) => {
-            CONFIG.SAFE_MODE = !CONFIG.SAFE_MODE;
-            e.currentTarget.classList.toggle('active');
-            GM_setValue('safeMode', CONFIG.SAFE_MODE);
-            log(`Безопасный режим: ${CONFIG.SAFE_MODE ? 'ВКЛ' : 'ВЫКЛ'}`);
+            log(`Цель XP: ${CONFIG.TARGET_XP}`);
         });
     }
 
     function updateUI() {
         const xpElement = document.getElementById('amyawe-xp');
         const lessonsElement = document.getElementById('amyawe-lessons');
+        const correctElement = document.getElementById('amyawe-correct');
         const timeElement = document.getElementById('amyawe-time');
         const statusElement = document.getElementById('amyawe-status');
 
         if (xpElement) xpElement.textContent = stats.xpEarned;
         if (lessonsElement) lessonsElement.textContent = stats.lessonsCompleted;
+        if (correctElement) correctElement.textContent = stats.correctAnswers;
         
         if (timeElement) {
             const elapsed = Math.floor((Date.now() - stats.startTime) / 1000);
@@ -556,24 +632,30 @@
     // ===========================================
     
     function init() {
-        log('Инициализация AmyAwe Auto Farm...', 'success');
+        log('🚀 Инициализация AmyAwe v2.0...', 'success');
         
-        // Ждем загрузки страницы
+        const checkAndCreateUI = () => {
+            if (document.body) {
+                createUI();
+                log('✓ UI создан', 'success');
+            } else {
+                setTimeout(checkAndCreateUI, 500);
+            }
+        };
+
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
-                setTimeout(createUI, 2000);
+                setTimeout(checkAndCreateUI, 1000);
             });
         } else {
-            setTimeout(createUI, 2000);
+            setTimeout(checkAndCreateUI, 1000);
         }
 
-        // Обновление UI каждую секунду
         setInterval(() => {
             if (isRunning) updateUI();
         }, 1000);
     }
 
-    // Запуск
     init();
 
 })();
